@@ -5,8 +5,10 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse, parse_qs
 
 from aiohttp import web
 import httpx
@@ -95,10 +97,10 @@ ADHAR_API_URL = "https://api.osintxc.com/aadhaar"
 ADHAR_API_KEY = "PULKIT"
 ADHAR_API_BACKUP = "https://reuters-memorabilia-insulin-disclose.trycloudflare.com/aadhaar"
 
-TG_API_URL = "https://rajfflivebot.onrender.com/pub/rajxbots/tg/Prateek_96?api_key=RAJXBOTS"
-TG_TO_NUM_PRIMARY = "https://rajfflivebot.onrender.com/pub/rajxbots/tg"
-TG_TO_NUM_API_KEY = "RAJXBOTS"
-TG_TO_NUM_BACKUP = "https://tg-to-num.backemdhub.workers.dev/?tg="
+TG_API_URL = "https://luffy-telegram-bot.onrender.com"
+TG_TO_NUM_PRIMARY = TG_API_URL
+TG_TO_NUM_API_KEY = "felix99"
+TG_TO_NUM_BACKUP = ""
 
 GMAIL_PRIMARY = "https://api.osintxc.com/email"
 GMAIL_KEY = "PULKIT"
@@ -288,6 +290,9 @@ def init_db():
             "api_family": "1",
             "api_insta": "1",
             "api_ff": "1",
+            "api_url_tg": TG_API_URL,
+            "api_key_tg": TG_TO_NUM_API_KEY,
+            "api_backup_url_tg": "",
         }
 
         for key, value in defaults.items():
@@ -351,7 +356,7 @@ API_BACKUP_DEFAULTS = {
     "num": (NUMBER_API_BACKUP, ""),
     "vehicle": (VEHICLE_API_BACKUP, VEHICLE_API_KEY),
     "adh": (ADHAR_API_BACKUP, ADHAR_API_KEY),
-    "tg": (TG_TO_NUM_BACKUP, TG_TO_NUM_API_KEY),
+    "tg": ("", ""),
     "gm": (GMAIL_BACKUP, GMAIL_KEY),
     "tc": ("", ""),
     "pin": ("", ""),
@@ -710,7 +715,6 @@ async def check_single_member(bot, chat_id: str, user_id: int) -> bool:
         if not target:
             return False
         if target.startswith(("https://t.me/", "http://t.me/")):
-            from urllib.parse import urlparse
             path = urlparse(target).path.strip("/")
             if not path or path.startswith("+") or path.startswith("joinchat/"):
                 return False
@@ -1168,7 +1172,7 @@ async def fetch_endpoint(url: str, params: dict) -> tuple[Optional[str], Optiona
                     follow_redirects=True,
                     limits=httpx.Limits(max_keepalive_connections=50, max_connections=100),
                 )
-            resp = await HTTP_CLIENT.get(url, params=params)
+            resp = await HTTP_CLIENT.get(url, params=params if params else None)
             if resp.status_code in (404, 400, 422, 500, 502, 503):
                 return None, None, f"HTTP_{resp.status_code}"
             resp.raise_for_status()
@@ -1236,6 +1240,10 @@ async def execute_api_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 backup_params = {}
             elif cmd_name == "adh":
                 backup_params = {"value": target_val, "key": backup_key}
+            elif cmd_name == "tg":
+                backup_params = {"tg": target_val}
+                if backup_key:
+                    backup_params["key"] = backup_key
             else:
                 backup_params = dict(params)
                 if backup_key:
@@ -1311,7 +1319,7 @@ def default_welcome_text(user) -> str:
         f"│ <code>/num &lt;val&gt;</code>     / Number lookup\n"
         f"│ <code>/vehicle &lt;rc&gt;</code>  / Vehicle lookup\n"
         f"│ <code>/adh &lt;val&gt;</code>     / ID lookup\n"
-        f"│ <code>/tg &lt;id&gt;</code>      / Public Telegram profile\n"
+        f"│ <code>/tg &lt;id&gt;</code>      / Telegram ID intel lookup\n"
         f"│ <code>/gm &lt;email&gt;</code>   / Email lookup\n"
         f"│ <code>/tc &lt;val&gt;</code>     / Caller lookup\n"
         f"│ <code>/pin &lt;code&gt;</code>   / Postal lookup\n"
@@ -1329,7 +1337,6 @@ def default_welcome_text(user) -> str:
         f"━━━━━━━━━━━━━━━━━━\n⌬ <b>END_SIGNAL</b>"
     )
 
-# --- OPTION B: SEPARATE MEDIA & COMPLETE UNCUT MESSAGE ---
 async def send_welcome(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE):
     w_text = get_setting("welcome_text")
     if not w_text:
@@ -1359,7 +1366,6 @@ async def send_welcome(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             logger.warning("Welcome media push failed (type=%s): %s", m_type, exc)
 
-    # Deliver complete uncut message
     try:
         await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML)
     except BadRequest:
@@ -1464,7 +1470,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"│ <code>/num &lt;val&gt;</code>    / Mobile search\n"
         f"│ <code>/vehicle &lt;rc&gt;</code> / Vehicle lookup\n"
         f"│ <code>/adh &lt;val&gt;</code>    / ID lookup\n"
-        f"│ <code>/tg &lt;id&gt;</code>     / Public Telegram profile\n"
+        f"│ <code>/tg &lt;id&gt;</code>     / Telegram ID intel lookup\n"
         f"│ <code>/gm &lt;email&gt;</code>  / Email lookup\n"
         f"│ <code>/tc &lt;val&gt;</code>    / Caller lookup\n"
         f"│ <code>/pin &lt;code&gt;</code>  / Postal PIN directory\n"
@@ -1567,62 +1573,16 @@ async def tg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user = update.effective_user
-    chat = update.effective_chat
-    searching_msg = None
-    final_output = "NOT FOUND"
-    log_status = "NOT FOUND"
+    tg_url, tg_key = api_config("tg")
+    tg_url = tg_url.rstrip("/")
 
-    try:
-        searching_msg = await update.message.reply_text(
-            "⚙️ <code>Checking Telegram-visible profile data... ⏳</code>",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
+    # Format explicitly as required by Luffy Bot endpoint: /key={KEY}&tg={VAL}
+    if "/key=" in tg_url:
+        req_url = f"{tg_url}&tg={val}"
+    else:
+        req_url = f"{tg_url}/key={tg_key}&tg={val}"
 
-    try:
-        profile = await context.bot.get_chat(chat_id=int(val))
-        profile_data = {
-            "telegram_id": profile.id,
-            "type": getattr(profile, "type", None),
-            "title": getattr(profile, "title", None),
-            "username": getattr(profile, "username", None),
-            "first_name": getattr(profile, "first_name", None),
-            "last_name": getattr(profile, "last_name", None),
-            "bio": getattr(profile, "bio", None),
-            "description": getattr(profile, "description", None),
-        }
-        profile_data = {key: value for key, value in profile_data.items() if value not in (None, "")}
-        if profile_data:
-            final_output = sanitize_response(json.dumps(profile_data, indent=2, ensure_ascii=False))
-            log_status = "SUCCESS_PUBLIC_PROFILE"
-            if user and not is_admin(user.id):
-                await asyncio.to_thread(consume_search, user.id, (chat.type == "private") if chat else True)
-    except Exception as exc:
-        logger.info("Telegram public profile lookup unavailable (%s)", type(exc).__name__)
-
-    if searching_msg:
-        try:
-            await searching_msg.delete()
-        except Exception:
-            pass
-
-    if user:
-        c_title = "DM (Personal)" if (chat and chat.type == "private") else ((chat.title or "Group") if chat else "Unknown")
-        audit_msg = (
-            f"┌───「 <b>🛰️ SURVEILLANCE TELEMETRY</b> 」───\n"
-            f"│ 👤 <b>Operative:</b> {html.escape(user.first_name or 'User')} (<code>{user.id}</code>)\n"
-            f"│ 🏷 <b>Handle:</b> @{html.escape(user.username or 'none')}\n"
-            f"│ ⚡ <b>Command:</b> <code>/tg</code> (Public Profile Lookup)\n"
-            f"│ 🎯 <b>Target:</b> <code>{html.escape(val)}</code>\n"
-            f"│ 📍 <b>Origin:</b> {html.escape(c_title)}\n"
-            f"│ 📊 <b>Status:</b> <code>{log_status}</code>\n"
-            f"└────────────────────────────────────────"
-        )
-        dispatch_audit_log(context, audit_msg)
-
-    await send_result(update, final_output)
+    await execute_api_search(update, context, req_url, {}, "tg", val)
 
 async def gmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not await check_search_access(update, context, "gm"):
@@ -2077,7 +2037,7 @@ async def show_admin_api_config(query):
     buttons.append([InlineKeyboardButton("🔙 Return to Mainframe", callback_data="adm_home")])
     await safe_edit_text(
         query,
-        "<b>🔑 PRIMARY + BACKUP API CONFIGURATION</b>\nChoose Primary or Backup. Send <code>URL | API_KEY</code>.\nExample: <code>https://example.com/api | my_key</code>",
+        "<b>🔑 PRIMARY + BACKUP API CONFIGURATION</b>\nChoose Primary or Backup. Send <code>URL | API_KEY</code> or paste query URL.\nExample: <code>https://example.com/api | my_key</code>",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -2188,6 +2148,32 @@ async def show_admin_settings(query):
     buttons = [[InlineKeyboardButton("🔙 Return to Mainframe", callback_data="adm_home")]]
     await safe_edit_text(query, text, reply_markup=InlineKeyboardMarkup(buttons))
 
+def parse_api_input(raw_input: str) -> tuple[str, Optional[str]]:
+    raw_input = raw_input.strip()
+    extracted_key = None
+    clean_url = raw_input
+
+    if "|" in raw_input:
+        parts = raw_input.split("|", 1)
+        clean_url = parts[0].strip()
+        extracted_key = parts[1].strip()
+    else:
+        if "/key=" in raw_input:
+            url_part, query_part = raw_input.split("/key=", 1)
+            clean_url = url_part.strip()
+            params = query_part.split("&")
+            extracted_key = params[0].strip()
+        elif "?" in raw_input:
+            parsed = urlparse(raw_input)
+            qs = parse_qs(parsed.query)
+            clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            for k in ("key", "api_key", "token", "apikey"):
+                if k in qs:
+                    extracted_key = qs[k][0]
+                    break
+
+    return clean_url, extracted_key
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -2286,7 +2272,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ADMIN_STATE[user.id] = f"awaiting_api_backup_config:{api_name}"
             current_url, current_key = api_backup_config(api_name)
             await safe_edit_text(query,
-                f"<b>Configure BACKUP /{api_name}</b>\nCurrent URL: <code>{html.escape(current_url or '(disabled)')}</code>\nCurrent key: <code>{html.escape(current_key or '(none)')}</code>\n\nSend: <code>URL | API_KEY</code>\nSend <code>OFF</code> as URL to disable backup. URL only keeps the current key.",
+                f"<b>Configure BACKUP /{api_name}</b>\nCurrent URL: <code>{html.escape(current_url or '(disabled)')}</code>\nCurrent key: <code>{html.escape(current_key or '(none)')}</code>\n\nSend: <code>URL | API_KEY</code>\nSend <code>OFF</code> as URL to disable backup.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_apiconfig")]]))
         elif data.startswith("adm_apiedit_"):
             api_name = data.replace("adm_apiedit_", "", 1)
@@ -2296,7 +2282,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ADMIN_STATE[user.id] = f"awaiting_api_config:{api_name}"
             current_url, current_key = api_config(api_name)
             await safe_edit_text(query,
-                f"<b>Configure /{api_name}</b>\nCurrent URL: <code>{html.escape(current_url)}</code>\nCurrent key: <code>{html.escape(current_key or '(none)')}</code>\n\nSend: <code>URL | API_KEY</code>\nURL only is also accepted; it keeps the current key.",
+                f"<b>Configure /{api_name}</b>\nCurrent URL: <code>{html.escape(current_url)}</code>\nCurrent key: <code>{html.escape(current_key or '(none)')}</code>\n\nSend: <code>URL | API_KEY</code> or paste link with key parameter.\nURL only keeps the current key.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="adm_apiconfig")]]))
         elif data == "adm_apis":
             await show_admin_apis(query)
@@ -2374,26 +2360,23 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚠️ Send the backup API URL as text.")
             return
         api_name = state.split(":", 1)[1]
-        parts = update.message.text.strip().split("|", 1)
-        new_url = parts[0].strip()
-        if new_url.upper() == "OFF":
+        raw_val = update.message.text.strip()
+        if raw_val.upper() == "OFF":
             set_setting(f"api_backup_url_{api_name}", "")
-            if len(parts) > 1:
-                new_key = parts[1].strip()
-                set_setting(f"api_backup_key_{api_name}", "" if new_key == "-" else new_key)
             ADMIN_STATE.pop(user.id, None)
             await update.message.reply_text(f"✅ Backup API for /{api_name} disabled.")
             await admin_command(update, context)
             return
+
+        new_url, new_key = parse_api_input(raw_val)
         if not re.match(r"^https?://", new_url, re.I):
             await update.message.reply_text("❌ URL must start with http:// or https://, or send OFF to disable.")
             return
         set_setting(f"api_backup_url_{api_name}", new_url)
-        if len(parts) > 1:
-            new_key = parts[1].strip()
+        if new_key is not None:
             set_setting(f"api_backup_key_{api_name}", "" if new_key == "-" else new_key)
         ADMIN_STATE.pop(user.id, None)
-        await update.message.reply_text(f"✅ Backup API configuration for /{api_name} saved.")
+        await update.message.reply_text(f"✅ Backup API configuration for /{api_name} saved.\nURL: <code>{new_url}</code>\nKey: <code>{new_key or '(unchanged)'}</code>", parse_mode=ParseMode.HTML)
         await admin_command(update, context)
         return
 
@@ -2402,17 +2385,18 @@ async def handle_admin_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚠️ Send the API URL as text.")
             return
         api_name = state.split(":", 1)[1]
-        parts = update.message.text.strip().split("|", 1)
-        new_url = parts[0].strip()
+        raw_val = update.message.text.strip()
+        new_url, new_key = parse_api_input(raw_val)
+
         if not re.match(r"^https?://", new_url, re.I):
             await update.message.reply_text("❌ URL must start with http:// or https://. Try again.")
             return
+
         set_setting(f"api_url_{api_name}", new_url)
-        if len(parts) > 1:
-            new_key = parts[1].strip()
+        if new_key is not None:
             set_setting(f"api_key_{api_name}", "" if new_key == "-" else new_key)
         ADMIN_STATE.pop(user.id, None)
-        await update.message.reply_text(f"✅ API configuration for /{api_name} saved.")
+        await update.message.reply_text(f"✅ API configuration for /{api_name} saved!\n\n🌐 URL: <code>{new_url}</code>\n🔑 Key: <code>{new_key or '(kept current)'}</code>", parse_mode=ParseMode.HTML)
         await admin_command(update, context)
         return
 
@@ -2837,7 +2821,7 @@ async def post_init(application: Application):
         BotCommand("num", "Mobile search"),
         BotCommand("vehicle", "Vehicle RC search"),
         BotCommand("adh", "ID record lookup"),
-        BotCommand("tg", "Telegram public profile lookup"),
+        BotCommand("tg", "Telegram ID intel lookup"),
         BotCommand("gm", "Gmail Cloudflare lookup"),
         BotCommand("tc", "Truecaller intel"),
         BotCommand("pin", "Postal PIN directory"),
@@ -2960,4 +2944,10 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
+    # Fix for Python 3.14 event loop initialization
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     main()
